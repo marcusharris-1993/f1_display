@@ -7,22 +7,29 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <TFT_eSPI.h>
+#include <ESP8266httpUpdate.h>
 
 TFT_eSPI tft = TFT_eSPI();
 ESP8266WebServer server(80);
 
-const char* FW_VERSION = "1.1.3";
+const char* FW_VERSION = "1.1.4";
 const char* CONFIG_FILE = "/config.json";
 const char* AP_SSID = "F1-Display-Setup";
 const char* HOSTNAME = "f1-display";
 
+const char* otaManifestUrl               = "https://marcusharris-1993.github.io/f1_display/version.json";
+const unsigned long OTA_CHECK_TIMEOUT_MS = 10000UL;
+
 const char* driverStandingsUrl      = "https://api.jolpi.ca/ergast/f1/current/driverStandings.json";
 const char* constructorStandingsUrl = "https://api.jolpi.ca/ergast/f1/current/constructorStandings.json";
 const char* nextRaceUrl             = "https://api.jolpi.ca/ergast/f1/current/next.json";
+const char* lastRaceResultsUrl      = "https://api.jolpi.ca/ergast/f1/current/last/results.json";
+const char* lastRacePitStopsUrl     = "https://api.jolpi.ca/ergast/f1/current/last/pitstops.json";
 
 const int MAX_DRIVERS = 30;
 const int MAX_CONSTRUCTORS = 20;
 const int MAX_RACE_EVENTS = 10;
+const int MAX_LAST_RACE_DRIVERS = 30;
 
 const int SCREEN_W = 320;
 const int SCREEN_H = 240;
@@ -94,10 +101,44 @@ struct NextRaceInfo {
   int eventCount;
 };
 
+struct PodiumEntry {
+  int position;
+  String surname;
+  String team;
+};
+
+struct LastRaceInfo {
+  bool valid;
+  String raceName;
+  String round;
+  String locality;
+  String country;
+  PodiumEntry podium[3];
+  int podiumCount;
+};
+
+struct FastestPitStopInfo {
+  bool valid;
+  String raceName;
+  String round;
+  String driverSurname;
+  String team;
+  String durationText;
+  String lap;
+  String stop;
+};
+
 DriverStanding drivers[MAX_DRIVERS];
 ConstructorStanding constructors[MAX_CONSTRUCTORS];
 NextRaceInfo nextRace;
+LastRaceInfo lastRace;
+FastestPitStopInfo fastestPitStop;
 AppConfig config;
+
+String lastRaceDriverIds[MAX_LAST_RACE_DRIVERS];
+String lastRaceDriverNames[MAX_LAST_RACE_DRIVERS];
+String lastRaceDriverTeams[MAX_LAST_RACE_DRIVERS];
+int lastRaceDriverMapCount = 0;
 
 int driverCount = 0;
 int constructorCount = 0;
@@ -112,7 +153,9 @@ enum PageType {
   PAGE_DRIVERS_1,
   PAGE_DRIVERS_2,
   PAGE_CONSTRUCTORS,
-  PAGE_NEXT_RACE
+  PAGE_NEXT_RACE,
+  PAGE_LAST_RACE,
+  PAGE_FASTEST_PIT_STOP
 };
 
 PageType currentPage = PAGE_DRIVERS_1;
@@ -182,11 +225,41 @@ String trimCopy(String value) {
   return value;
 }
 
+int compareVersions(const String& currentVersion, const String& newVersion) {
+  int c1 = 0, c2 = 0, c3 = 0;
+  int n1 = 0, n2 = 0, n3 = 0;
+
+  sscanf(currentVersion.c_str(), "%d.%d.%d", &c1, &c2, &c3);
+  sscanf(newVersion.c_str(), "%d.%d.%d", &n1, &n2, &n3);
+
+  if (n1 != c1) return (n1 > c1) ? 1 : -1;
+  if (n2 != c2) return (n2 > c2) ? 1 : -1;
+  if (n3 != c3) return (n3 > c3) ? 1 : -1;
+  return 0;
+}
+
 String timezoneLabelFromKey(const String& key) {
   for (int i = 0; i < TIMEZONE_COUNT; i++) {
     if (key == timezoneOptions[i].key) return String(timezoneOptions[i].label);
   }
   return "Unknown";
+}
+
+bool parseDurationSeconds(const String& text, float& secondsOut) {
+  if (text.length() == 0) return false;
+  secondsOut = text.toFloat();
+  return secondsOut > 0.0f;
+}
+
+bool lookupLastRaceDriver(const String& driverId, String& surnameOut, String& teamOut) {
+  for (int i = 0; i < lastRaceDriverMapCount; i++) {
+    if (lastRaceDriverIds[i] == driverId) {
+      surnameOut = lastRaceDriverNames[i];
+      teamOut = lastRaceDriverTeams[i];
+      return true;
+    }
+  }
+  return false;
 }
 
 void setDefaultConfig() {
@@ -261,6 +334,7 @@ bool loadConfig() {
   if (!LittleFS.exists(CONFIG_FILE)) {
     logLine("Config file not found, using defaults");
     setDefaultConfig();
+    applyRuntimeConfig();
     return false;
   }
 
@@ -268,6 +342,7 @@ bool loadConfig() {
   if (!f) {
     logLine("Failed to open config file, using defaults");
     setDefaultConfig();
+    applyRuntimeConfig();
     return false;
   }
 
@@ -278,6 +353,7 @@ bool loadConfig() {
   if (err) {
     logLine("Config parse failed, using defaults");
     setDefaultConfig();
+    applyRuntimeConfig();
     return false;
   }
 
@@ -344,9 +420,19 @@ String formatEpochDisplay(long long epochUtc) {
   }
 }
 
+String formatLastRefreshTime() {
+  time_t raw = time(nullptr);
+  struct tm* local = localtime(&raw);
+  if (local == nullptr) return "UNKNOWN";
+  char buffer[24];
+  strftime(buffer, sizeof(buffer), "%d/%m %H:%M", local);
+  return String(buffer);
+}
+
 bool beginSecureHttp(HTTPClient& http, std::unique_ptr<BearSSL::WiFiClientSecure>& client, const char* url) {
   client.reset(new BearSSL::WiFiClientSecure);
   client->setInsecure();
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   return http.begin(*client, url);
 }
 
@@ -572,7 +658,7 @@ bool fetchNextRace() {
   addRaceEvent(nextRace, "FP2", race["SecondPractice"]);
   addRaceEvent(nextRace, "FP3", race["ThirdPractice"]);
   addRaceEvent(nextRace, "SQ", race["SprintQualifying"]);
-  addRaceEvent(nextRace, "SQ", race["SprintShootout"]);
+  addRaceEvent(nextRace, "SO", race["SprintShootout"]);
   addRaceEvent(nextRace, "QUAL", race["Qualifying"]);
   addRaceEvent(nextRace, "SPR", race["Sprint"]);
 
@@ -595,6 +681,172 @@ bool fetchNextRace() {
   }
 
   sortRaceEvents(nextRace);
+  http.end();
+  return true;
+}
+
+bool fetchLastRaceResults() {
+  std::unique_ptr<BearSSL::WiFiClientSecure> client;
+  HTTPClient http;
+
+  lastRace.valid = false;
+  lastRace.podiumCount = 0;
+  lastRaceDriverMapCount = 0;
+
+  if (!beginSecureHttp(http, client, lastRaceResultsUrl)) return false;
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  StaticJsonDocument<2048> filter;
+  JsonObject raceFilter = filter["MRData"]["RaceTable"]["Races"][0].to<JsonObject>();
+  raceFilter["round"] = true;
+  raceFilter["raceName"] = true;
+  raceFilter["Circuit"]["Location"]["locality"] = true;
+  raceFilter["Circuit"]["Location"]["country"] = true;
+  JsonObject resultFilter = raceFilter["Results"][0].to<JsonObject>();
+  resultFilter["position"] = true;
+  resultFilter["Driver"]["driverId"] = true;
+  resultFilter["Driver"]["familyName"] = true;
+  resultFilter["Constructor"]["name"] = true;
+
+  DynamicJsonDocument doc(26000);
+  DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  if (error) {
+    http.end();
+    return false;
+  }
+
+  JsonObject race = doc["MRData"]["RaceTable"]["Races"][0];
+  if (race.isNull()) {
+    http.end();
+    return false;
+  }
+
+  JsonArray results = race["Results"];
+  if (results.isNull()) {
+    http.end();
+    return false;
+  }
+
+  lastRace.valid = true;
+  lastRace.round = String(race["round"] | "");
+  lastRace.raceName = normalizeToAscii(String(race["raceName"] | ""));
+  lastRace.locality = normalizeToAscii(String(race["Circuit"]["Location"]["locality"] | ""));
+  lastRace.country = normalizeToAscii(String(race["Circuit"]["Location"]["country"] | ""));
+  lastRace.podiumCount = 0;
+
+  for (JsonObject row : results) {
+    String driverId = String(row["Driver"]["driverId"] | "");
+    String surname = normalizeToAscii(String(row["Driver"]["familyName"] | ""));
+    String team = normalizeToAscii(String(row["Constructor"]["name"] | ""));
+    int pos = row["position"].as<int>();
+
+    if (lastRaceDriverMapCount < MAX_LAST_RACE_DRIVERS) {
+      lastRaceDriverIds[lastRaceDriverMapCount] = driverId;
+      lastRaceDriverNames[lastRaceDriverMapCount] = surname;
+      lastRaceDriverTeams[lastRaceDriverMapCount] = team;
+      lastRaceDriverMapCount++;
+    }
+
+    if (pos >= 1 && pos <= 3 && lastRace.podiumCount < 3) {
+      lastRace.podium[lastRace.podiumCount].position = pos;
+      lastRace.podium[lastRace.podiumCount].surname = surname;
+      lastRace.podium[lastRace.podiumCount].team = team;
+      lastRace.podiumCount++;
+    }
+  }
+
+  http.end();
+  return true;
+}
+
+bool fetchFastestPitStop() {
+  std::unique_ptr<BearSSL::WiFiClientSecure> client;
+  HTTPClient http;
+
+  fastestPitStop.valid = false;
+
+  if (!beginSecureHttp(http, client, lastRacePitStopsUrl)) return false;
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  StaticJsonDocument<1536> filter;
+  JsonObject raceFilter = filter["MRData"]["RaceTable"]["Races"][0].to<JsonObject>();
+  raceFilter["round"] = true;
+  raceFilter["raceName"] = true;
+  JsonObject pitFilter = raceFilter["PitStops"][0].to<JsonObject>();
+  pitFilter["driverId"] = true;
+  pitFilter["lap"] = true;
+  pitFilter["stop"] = true;
+  pitFilter["duration"] = true;
+
+  DynamicJsonDocument doc(24000);
+  DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  if (error) {
+    http.end();
+    return false;
+  }
+
+  JsonObject race = doc["MRData"]["RaceTable"]["Races"][0];
+  if (race.isNull()) {
+    http.end();
+    return false;
+  }
+
+  JsonArray pitStops = race["PitStops"];
+  if (pitStops.isNull()) {
+    http.end();
+    return false;
+  }
+
+  bool found = false;
+  float bestDuration = 0.0f;
+  String bestDriverId;
+  String bestLap;
+  String bestStop;
+  String bestDurationText;
+
+  for (JsonObject row : pitStops) {
+    String durationText = String(row["duration"] | "");
+    float seconds = 0.0f;
+    if (!parseDurationSeconds(durationText, seconds)) continue;
+
+    if (!found || seconds < bestDuration) {
+      found = true;
+      bestDuration = seconds;
+      bestDriverId = String(row["driverId"] | "");
+      bestLap = String(row["lap"] | "");
+      bestStop = String(row["stop"] | "");
+      bestDurationText = durationText;
+    }
+  }
+
+  if (!found) {
+    http.end();
+    return false;
+  }
+
+  String surname = bestDriverId;
+  String team = "";
+  lookupLastRaceDriver(bestDriverId, surname, team);
+
+  fastestPitStop.valid = true;
+  fastestPitStop.round = String(race["round"] | "");
+  fastestPitStop.raceName = normalizeToAscii(String(race["raceName"] | ""));
+  fastestPitStop.driverSurname = normalizeToAscii(surname);
+  fastestPitStop.team = normalizeToAscii(team);
+  fastestPitStop.durationText = bestDurationText;
+  fastestPitStop.lap = bestLap;
+  fastestPitStop.stop = bestStop;
+
   http.end();
   return true;
 }
@@ -676,43 +928,39 @@ void drawDriverRow(int rowIndex, const DriverStanding& d) {
   int rowH = CONTENT_H / DRIVER_ROWS_PER_PAGE;
   int y = CONTENT_TOP + (rowIndex * rowH);
 
-  if (rowIndex > 0) {
-    tft.drawFastHLine(0, y - 2, SCREEN_W, COL_LINE);
-  }
+  if (rowIndex > 0) tft.drawFastHLine(0, y - 2, SCREEN_W, COL_LINE);
 
   uint16_t posColor = (d.position <= 3) ? COL_TITLE : COL_TEXT;
 
   tft.setTextColor(posColor, COL_BG);
-  tft.drawRightString(String(d.position), 34, y + 1, 1);
+  tft.drawRightString(String(d.position), 34, y + 1, 2);
 
   tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString(clipText(d.surname, 11), 48, y + 1, 1);
+  tft.drawString(clipText(d.surname, 11), 48, y + 1, 2);
 
   tft.setTextColor(COL_HIGHLIGHT, COL_BG);
-  tft.drawString(clipText(d.team, 15), 155, y + 3, 1);
+  tft.drawString(clipText(d.team, 15), 155, y + 1, 2);
 
   tft.setTextColor(COL_TITLE, COL_BG);
-  tft.drawRightString(d.points, 312, y + 1, 1);
+  tft.drawRightString(d.points, 312, y + 1, 2);
 }
 
 void drawConstructorRow(int rowIndex, const ConstructorStanding& c) {
   int rowH = CONTENT_H / CONSTRUCTOR_ROWS_PER_PAGE;
   int y = CONTENT_TOP + (rowIndex * rowH);
 
-  if (rowIndex > 0) {
-    tft.drawFastHLine(0, y - 2, SCREEN_W, COL_LINE);
-  }
+  if (rowIndex > 0) tft.drawFastHLine(0, y - 2, SCREEN_W, COL_LINE);
 
   uint16_t posColor = (c.position <= 3) ? COL_TITLE : COL_TEXT;
 
   tft.setTextColor(posColor, COL_BG);
-  tft.drawRightString(String(c.position), 34, y + 1, 1);
+  tft.drawRightString(String(c.position), 34, y + 1, 2);
 
   tft.setTextColor(COL_HIGHLIGHT, COL_BG);
-  tft.drawString(clipText(c.name, 24), 50, y + 1, 1);
+  tft.drawString(clipText(c.name, 24), 50, y + 1, 2);
 
   tft.setTextColor(COL_TITLE, COL_BG);
-  tft.drawRightString(c.points, 312, y + 1, 1);
+  tft.drawRightString(c.points, 312, y + 1, 2);
 }
 
 void drawRaceInfoLine(const String& label, const String& value, int y, uint16_t valueColor) {
@@ -816,6 +1064,74 @@ void renderNextRacePage() {
   drawFooter("UPDATED " + lastRefreshText);
 }
 
+void renderLastRacePage() {
+  clearMainArea();
+  drawTopHeader("F1 LAST RACE", "P105");
+  drawTitleBar("PODIUM");
+
+  if (!lastRace.valid || lastRace.podiumCount == 0) {
+    tft.setTextColor(COL_ALERT, COL_BG);
+    tft.drawString("NO DATA", 8, CONTENT_TOP + 8, 2);
+    drawFooter("UPDATED " + lastRefreshText);
+    return;
+  }
+
+  int y = HEADER_H + TITLE_H + 4;
+  drawRaceInfoLine("ROUND", lastRace.round, y, COL_TITLE); y += 16;
+  drawRaceInfoLine("RACE", clipText(lastRace.raceName, 24), y, COL_TEXT); y += 16;
+  drawRaceInfoLine("PLACE", clipText(lastRace.locality + ", " + lastRace.country, 24), y, COL_HIGHLIGHT); y += 20;
+
+  tft.setTextColor(COL_LABEL, COL_BG);
+  tft.drawString("POS", 8, y, 2);
+  tft.drawString("DRIVER", 50, y, 2);
+  tft.drawString("TEAM", 170, y, 2);
+  tft.drawFastHLine(0, y + 16, SCREEN_W, COL_LABEL);
+  y += 20;
+
+  for (int i = 0; i < lastRace.podiumCount; i++) {
+    if (i > 0) tft.drawFastHLine(0, y - 3, SCREEN_W, COL_LINE);
+
+    uint16_t posColor = (i == 0) ? COL_TITLE : COL_TEXT;
+
+    tft.setTextColor(posColor, COL_BG);
+    tft.drawRightString(String(lastRace.podium[i].position), 34, y, 2);
+
+    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.drawString(clipText(lastRace.podium[i].surname, 13), 50, y, 2);
+
+    tft.setTextColor(COL_HIGHLIGHT, COL_BG);
+    tft.drawString(clipText(lastRace.podium[i].team, 14), 170, y, 2);
+
+    y += 24;
+  }
+
+  drawFooter("UPDATED " + lastRefreshText);
+}
+
+void renderFastestPitStopPage() {
+  clearMainArea();
+  drawTopHeader("F1 PIT STOP", "P106");
+  drawTitleBar("FASTEST LAST RACE");
+
+  if (!fastestPitStop.valid) {
+    tft.setTextColor(COL_ALERT, COL_BG);
+    tft.drawString("NO DATA", 8, CONTENT_TOP + 8, 2);
+    drawFooter("UPDATED " + lastRefreshText);
+    return;
+  }
+
+  int y = HEADER_H + TITLE_H + 6;
+  drawRaceInfoLine("ROUND", fastestPitStop.round, y, COL_TITLE); y += 18;
+  drawRaceInfoLine("RACE", clipText(fastestPitStop.raceName, 24), y, COL_TEXT); y += 18;
+  drawRaceInfoLine("DRIVER", clipText(fastestPitStop.driverSurname, 20), y, COL_TEXT); y += 18;
+  drawRaceInfoLine("TEAM", clipText(fastestPitStop.team, 20), y, COL_HIGHLIGHT); y += 18;
+  drawRaceInfoLine("TIME", fastestPitStop.durationText + "S", y, COL_TITLE); y += 18;
+  drawRaceInfoLine("LAP", fastestPitStop.lap, y, COL_TEXT); y += 18;
+  drawRaceInfoLine("STOP", fastestPitStop.stop, y, COL_TEXT); y += 18;
+
+  drawFooter("UPDATED " + lastRefreshText);
+}
+
 void renderSetupScreen(const String& line1, const String& line2 = "", const String& line3 = "") {
   tft.fillScreen(COL_BG);
   tft.fillRect(0, 0, SCREEN_W, HEADER_H, COL_HEADER_BG);
@@ -842,396 +1158,471 @@ void renderSetupScreen(const String& line1, const String& line2 = "", const Stri
   drawFooter(inApMode ? "AP MODE" : "STARTING");
 }
 
+void showOtaStatus(const String& line1, const String& line2 = "", const String& line3 = "") {
+  renderSetupScreen(line1, line2, line3);
+}
+
+bool fetchOtaManifest(String& newVersion, String& firmwareUrl) {
+  std::unique_ptr<BearSSL::WiFiClientSecure> client;
+  HTTPClient http;
+
+  if (!beginSecureHttp(http, client, otaManifestUrl)) {
+    logLine("OTA: failed to begin manifest request");
+    return false;
+  }
+
+  http.setTimeout(OTA_CHECK_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    logLine("OTA: manifest HTTP error " + String(httpCode));
+    http.end();
+    return false;
+  }
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+
+  if (err) {
+    logLine("OTA: manifest JSON parse failed");
+    return false;
+  }
+
+  newVersion = String(doc["version"] | "");
+  firmwareUrl = String(doc["firmware"] | "");
+
+  if (newVersion.length() == 0 || firmwareUrl.length() == 0) {
+    logLine("OTA: manifest missing version or firmware URL");
+    return false;
+  }
+
+  return true;
+}
+
+void checkForOtaUpdate() {
+  if (WiFi.status() != WL_CONNECTED) {
+    logLine("OTA: skipped, WiFi not connected");
+    return;
+  }
+
+  String onlineVersion;
+  String firmwareUrl;
+
+  showOtaStatus("CHECKING FOR UPDATE", "CURRENT: " + String(FW_VERSION));
+
+  if (!fetchOtaManifest(onlineVersion, firmwareUrl)) {
+    logLine("OTA: manifest fetch failed");
+    delay(800);
+    return;
+  }
+
+  logLine("OTA: current version = " + String(FW_VERSION));
+  logLine("OTA: online version  = " + onlineVersion);
+  logLine("OTA: firmware URL    = " + firmwareUrl);
+
+  int versionCompare = compareVersions(String(FW_VERSION), onlineVersion);
+
+  if (versionCompare >= 0) {
+    logLine("OTA: no newer firmware available");
+    showOtaStatus("NO UPDATE NEEDED", "VERSION " + String(FW_VERSION));
+    delay(800);
+    return;
+  }
+
+  showOtaStatus("UPDATING FIRMWARE", "TO VERSION " + onlineVersion, "PLEASE WAIT");
+
+  BearSSL::WiFiClientSecure otaClient;
+  otaClient.setInsecure();
+
+  ESPhttpUpdate.rebootOnUpdate(true);
+  ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  t_httpUpdate_return ret = ESPhttpUpdate.update(otaClient, firmwareUrl);
+
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      logLine("OTA: update failed, error (" +
+              String(ESPhttpUpdate.getLastError()) + "): " +
+              ESPhttpUpdate.getLastErrorString());
+      showOtaStatus("UPDATE FAILED", ESPhttpUpdate.getLastErrorString());
+      delay(2000);
+      break;
+
+    case HTTP_UPDATE_NO_UPDATES:
+      logLine("OTA: server reported no updates");
+      showOtaStatus("NO UPDATE FOUND");
+      delay(1000);
+      break;
+
+    case HTTP_UPDATE_OK:
+      logLine("OTA: update successful, rebooting");
+      break;
+  }
+}
+
 void renderCurrentPage() {
   switch (currentPage) {
     case PAGE_DRIVERS_1:
       renderDriversPage(0, "P101", "UPDATED " + lastRefreshText);
       break;
+
     case PAGE_DRIVERS_2:
       renderDriversPage(DRIVER_ROWS_PER_PAGE, "P102", "UPDATED " + lastRefreshText);
       break;
+
     case PAGE_CONSTRUCTORS:
       renderConstructorsPage();
       break;
+
     case PAGE_NEXT_RACE:
       renderNextRacePage();
+      break;
+
+    case PAGE_LAST_RACE:
+      renderLastRacePage();
+      break;
+
+    case PAGE_FASTEST_PIT_STOP:
+      renderFastestPitStopPage();
+      break;
+
+    default:
+      renderDriversPage(0, "P101", "UPDATED " + lastRefreshText);
       break;
   }
 }
 
 void nextPage() {
-  currentPage = (PageType)(((int)currentPage + 1) % 4);
-}
+  switch (currentPage) {
+    case PAGE_DRIVERS_1:
+      currentPage = (driverCount > DRIVER_ROWS_PER_PAGE) ? PAGE_DRIVERS_2 : PAGE_CONSTRUCTORS;
+      break;
 
-String getTimezoneOptionsHtml() {
-  String html;
-  for (int i = 0; i < TIMEZONE_COUNT; i++) {
-    html += "<option value='";
-    html += timezoneOptions[i].key;
-    html += "'";
-    if (config.timezoneKey == timezoneOptions[i].key) html += " selected";
-    html += ">";
-    html += timezoneOptions[i].label;
-    html += "</option>";
+    case PAGE_DRIVERS_2:
+      currentPage = PAGE_CONSTRUCTORS;
+      break;
+
+    case PAGE_CONSTRUCTORS:
+      currentPage = PAGE_NEXT_RACE;
+      break;
+
+    case PAGE_NEXT_RACE:
+      currentPage = PAGE_LAST_RACE;
+      break;
+
+    case PAGE_LAST_RACE:
+      currentPage = PAGE_FASTEST_PIT_STOP;
+      break;
+
+    case PAGE_FASTEST_PIT_STOP:
+    default:
+      currentPage = PAGE_DRIVERS_1;
+      break;
   }
-  return html;
+
+  renderCurrentPage();
 }
 
-String getSettingsPageHtml(const String& message = "") {
+bool connectToWifi() {
+  if (config.wifiSsid.length() == 0) {
+    logLine("WiFi SSID not configured");
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(HOSTNAME);
+  WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
+
+  renderSetupScreen("CONNECTING WIFI", config.wifiSsid);
+
+  unsigned long startMs = millis();
+  int retryCounter = 0;
+
+  while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_RETRY_WINDOW_MS) {
+    delay(500);
+    Serial.print(".");
+    retryCounter++;
+    if (retryCounter >= WIFI_RETRY_COUNT) retryCounter = 0;
+    yield();
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    ipAddressText = WiFi.localIP().toString();
+    logLine("WiFi connected: " + ipAddressText);
+    return true;
+  }
+
+  logLine("WiFi connection failed");
+  return false;
+}
+
+void startApMode() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID);
+  IPAddress ip = WiFi.softAPIP();
+  ipAddressText = ip.toString();
+  inApMode = true;
+  logLine("AP mode started: " + ipAddressText);
+  renderSetupScreen("SETUP MODE ACTIVE", AP_SSID, ipAddressText);
+}
+
+void syncTimeNow() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+
+  for (int i = 0; i < 20; i++) {
+    time_t now = time(nullptr);
+    if (now > 100000) {
+      logLine("Time sync complete");
+      return;
+    }
+    delay(500);
+    yield();
+  }
+
+  logLine("Time sync timeout");
+}
+
+bool refreshAllData() {
+  bool okDrivers = fetchDriverStandings();
+  bool okConstructors = fetchConstructorStandings();
+  bool okNextRace = fetchNextRace();
+  bool okLastRace = fetchLastRaceResults();
+  bool okPit = fetchFastestPitStop();
+
+  bool overall = okDrivers || okConstructors || okNextRace || okLastRace || okPit;
+
+  if (overall) {
+    lastRefreshText = formatLastRefreshTime();
+    lastRefresh = millis();
+  }
+
+  logLine("Refresh status:");
+  logLine("  Drivers: " + String(okDrivers ? "OK" : "FAIL"));
+  logLine("  Constructors: " + String(okConstructors ? "OK" : "FAIL"));
+  logLine("  Next race: " + String(okNextRace ? "OK" : "FAIL"));
+  logLine("  Last race: " + String(okLastRace ? "OK" : "FAIL"));
+  logLine("  Pit stop: " + String(okPit ? "OK" : "FAIL"));
+
+  return overall;
+}
+
+String buildHtmlPage() {
   String html;
-  html += "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>F1 Display Settings</title>";
+  html.reserve(7000);
+
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>F1 Display Setup</title>";
   html += "<style>";
-  html += "body{font-family:Arial,sans-serif;margin:20px;background:#f4f4f4;color:#111;}";
-  html += "h1{font-size:24px;margin-bottom:8px;}label{display:block;margin-top:14px;font-weight:bold;}";
-  html += "input,select{width:100%;padding:10px;margin-top:6px;box-sizing:border-box;}";
-  html += "button{display:inline-block;margin-top:16px;padding:12px 18px;border:none;background:#0033aa;color:#fff;cursor:pointer;}";
-  html += ".card{max-width:760px;background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);}";
-  html += ".msg{padding:10px;background:#e8f4ff;border-left:4px solid #0033aa;margin-bottom:16px;}";
-  html += ".danger{background:#b00020;}.actions form{display:inline-block;margin-right:8px;}";
-  html += "small{color:#555;}";
+  html += "body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:20px;}";
+  html += ".card{max-width:720px;margin:0 auto;background:#1b1b1b;padding:20px;border-radius:10px;}";
+  html += "h1,h2{margin-top:0;color:#ff0;}label{display:block;margin-top:12px;margin-bottom:6px;color:#8ff;}";
+  html += "input,select{width:100%;padding:10px;border-radius:6px;border:1px solid #555;background:#000;color:#fff;box-sizing:border-box;}";
+  html += "button,.btn{display:inline-block;margin-top:16px;padding:10px 14px;border:none;border-radius:6px;background:#0044cc;color:#fff;text-decoration:none;cursor:pointer;}";
+  html += ".danger{background:#b00020;} .muted{color:#bbb;font-size:14px;} .row{margin-top:8px;} .mono{font-family:monospace;}";
   html += "</style></head><body><div class='card'>";
-  html += "<h1>F1 Display Settings</h1>";
 
-  if (message.length()) {
-    html += "<div class='msg'>" + htmlEscape(message) + "</div>";
+  html += "<h1>F1 Display Setup</h1>";
+  html += "<p class='muted'>Firmware: <span class='mono'>" + htmlEscape(String(FW_VERSION)) + "</span></p>";
+  html += "<p class='muted'>IP: <span class='mono'>" + htmlEscape(ipAddressText) + "</span></p>";
+  html += "<p class='muted'>Mode: " + String(inApMode ? "Access Point" : "WiFi Client") + "</p>";
+
+  html += "<h2>Configuration</h2>";
+  html += "<form method='post' action='/save'>";
+  html += "<label>WiFi SSID</label><input name='wifiSsid' value='" + htmlEscape(config.wifiSsid) + "'>";
+  html += "<label>WiFi Password</label><input name='wifiPassword' type='password' value='" + htmlEscape(config.wifiPassword) + "'>";
+
+  html += "<label>Timezone</label><select name='timezoneKey'>";
+  for (int i = 0; i < TIMEZONE_COUNT; i++) {
+    html += "<option value='" + htmlEscape(String(timezoneOptions[i].key)) + "'";
+    if (config.timezoneKey == timezoneOptions[i].key) html += " selected";
+    html += ">" + htmlEscape(String(timezoneOptions[i].label)) + "</option>";
   }
+  html += "</select>";
 
-  html += "<p><strong>Firmware:</strong> " + String(FW_VERSION);
-  html += "<br><strong>Mode:</strong> " + String(inApMode ? "Access Point" : "Normal");
-  html += "<br><strong>IP:</strong> " + htmlEscape(ipAddressText);
-  html += "<br><strong>Hostname:</strong> " + String(inApMode ? "Not available in AP mode" : "f1-display.local");
-  html += "<br><strong>Timezone:</strong> " + htmlEscape(timezoneLabelFromKey(config.timezoneKey));
-  html += "</p>";
+  html += "<label>Page interval (seconds)</label><input name='pageIntervalSec' type='number' min='3' max='60' value='" + String(config.pageIntervalSec) + "'>";
+  html += "<label>Refresh interval (minutes)</label><input name='refreshIntervalMin' type='number' min='1' max='120' value='" + String(config.refreshIntervalMin) + "'>";
 
-  html += "<form method='POST' action='/save'>";
-  html += "<label>WiFi SSID</label>";
-  html += "<input name='wifiSsid' value='" + htmlEscape(config.wifiSsid) + "' maxlength='32' required>";
+  html += "<label>Clock format</label><select name='clockFormat24'>";
+  html += "<option value='1'" + String(config.clockFormat24 ? " selected" : "") + ">24 hour</option>";
+  html += "<option value='0'" + String(!config.clockFormat24 ? " selected" : "") + ">12 hour</option>";
+  html += "</select>";
 
-  html += "<label>WiFi Password</label>";
-  html += "<input name='wifiPassword' type='password' value='" + htmlEscape(config.wifiPassword) + "' maxlength='63'>";
-
-  html += "<label>Timezone</label>";
-  html += "<select name='timezoneKey'>" + getTimezoneOptionsHtml() + "</select>";
-
-  html += "<label>Page Interval (seconds)</label>";
-  html += "<input name='pageIntervalSec' type='number' min='3' max='60' value='" + String(config.pageIntervalSec) + "' required>";
-
-  html += "<label>Refresh Interval (minutes)</label>";
-  html += "<input name='refreshIntervalMin' type='number' min='1' max='120' value='" + String(config.refreshIntervalMin) + "' required>";
-
-  html += "<label>Clock Format</label>";
-  html += "<select name='clockFormat'><option value='24'";
-  if (config.clockFormat24) html += " selected";
-  html += ">24 Hour</option><option value='12'";
-  if (!config.clockFormat24) html += " selected";
-  html += ">12 Hour</option></select>";
-
-  html += "<button type='submit'>Save Settings</button>";
+  html += "<div class='row'><button type='submit'>Save Configuration</button></div>";
   html += "</form>";
 
-  html += "<div class='actions'>";
-  html += "<form method='POST' action='/reboot'><button type='submit'>Reboot Device</button></form>";
-  html += "<form method='POST' action='/reset-settings'><button type='submit' class='danger'>Reset Settings</button></form>";
-  html += "</div>";
+  html += "<h2>Actions</h2>";
+  html += "<p><a class='btn' href='/refresh'>Refresh Data Now</a></p>";
+  html += "<p><a class='btn' href='/ota'>Check OTA Update</a></p>";
+  html += "<p><a class='btn danger' href='/reset'>Reset Settings</a></p>";
 
-  html += "<p><small>Saving settings will reboot the device after 3 seconds.</small></p>";
+  html += "<h2>Device Info</h2>";
+  html += "<p class='muted'>Last refresh: " + htmlEscape(lastRefreshText) + "</p>";
+  html += "<p class='muted'>Timezone: " + htmlEscape(timezoneLabelFromKey(config.timezoneKey)) + "</p>";
   html += "</div></body></html>";
+
   return html;
 }
 
-String getSavedPageHtml(const String& message) {
-  String html;
-  html += "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<meta http-equiv='refresh' content='3;url=/'>";
-  html += "<title>Saved</title>";
-  html += "<style>body{font-family:Arial,sans-serif;background:#f4f4f4;padding:20px;} .card{max-width:600px;background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);}</style>";
-  html += "</head><body><div class='card'><h1>" + htmlEscape(message) + "</h1><p>Device will reboot in 3 seconds.</p></div></body></html>";
-  return html;
+void handleRoot() {
+  server.send(200, "text/html", buildHtmlPage());
 }
 
-void delayedRebootMessage(const String& line1, const String& line2) {
-  renderSetupScreen(line1, line2, "REBOOTING...");
+void handleSave() {
+  config.wifiSsid = trimCopy(server.arg("wifiSsid"));
+  config.wifiPassword = server.arg("wifiPassword");
+  config.pageIntervalSec = (uint16_t)server.arg("pageIntervalSec").toInt();
+  config.refreshIntervalMin = (uint16_t)server.arg("refreshIntervalMin").toInt();
+  config.clockFormat24 = (server.arg("clockFormat24") != "0");
+
+  String tzKey = trimCopy(server.arg("timezoneKey"));
+  if (!applyTimezoneFromKey(tzKey)) {
+    applyTimezoneFromKey("GMT");
+  }
+
+  applyRuntimeConfig();
+  saveConfig();
+
+  server.send(200, "text/html",
+    "<html><body style='font-family:Arial;background:#111;color:#fff;padding:20px;'>"
+    "<h2>Configuration saved</h2>"
+    "<p>Device will reboot in 3 seconds.</p>"
+    "</body></html>"
+  );
+
   delay(3000);
   ESP.restart();
 }
 
-void handleRoot() {
-  server.send(200, "text/html", getSettingsPageHtml());
+void handleRefresh() {
+  bool ok = false;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    syncTimeNow();
+    ok = refreshAllData();
+    renderCurrentPage();
+  }
+
+  server.send(200, "text/html",
+    String("<html><body style='font-family:Arial;background:#111;color:#fff;padding:20px;'><h2>Refresh ") +
+    (ok ? "successful" : "failed") +
+    "</h2><p><a href='/'>Back</a></p></body></html>");
 }
 
-void handleSave() {
-  if (!server.hasArg("wifiSsid") || !server.hasArg("timezoneKey") || !server.hasArg("pageIntervalSec") ||
-      !server.hasArg("refreshIntervalMin") || !server.hasArg("clockFormat")) {
-    server.send(400, "text/html", getSettingsPageHtml("Missing required fields."));
-    return;
-  }
-
-  String wifiSsid = trimCopy(server.arg("wifiSsid"));
-  String wifiPassword = trimCopy(server.arg("wifiPassword"));
-  String timezoneKey = trimCopy(server.arg("timezoneKey"));
-  int pageIntervalSec = server.arg("pageIntervalSec").toInt();
-  int refreshIntervalMin = server.arg("refreshIntervalMin").toInt();
-  String clockFormat = trimCopy(server.arg("clockFormat"));
-
-  if (wifiSsid.length() < 1 || wifiSsid.length() > 32) {
-    server.send(400, "text/html", getSettingsPageHtml("WiFi SSID must be between 1 and 32 characters."));
-    return;
-  }
-
-  if (pageIntervalSec < 3 || pageIntervalSec > 60) {
-    server.send(400, "text/html", getSettingsPageHtml("Page interval must be between 3 and 60 seconds."));
-    return;
-  }
-
-  if (refreshIntervalMin < 1 || refreshIntervalMin > 120) {
-    server.send(400, "text/html", getSettingsPageHtml("Refresh interval must be between 1 and 120 minutes."));
-    return;
-  }
-
-  config.wifiSsid = wifiSsid;
-  config.wifiPassword = wifiPassword;
-  config.pageIntervalSec = (uint16_t)pageIntervalSec;
-  config.refreshIntervalMin = (uint16_t)refreshIntervalMin;
-  config.clockFormat24 = (clockFormat == "24");
-
-  if (!applyTimezoneFromKey(timezoneKey)) {
-    server.send(400, "text/html", getSettingsPageHtml("Invalid timezone selected."));
-    return;
-  }
-
-  logLine("Saving updated settings");
-  applyRuntimeConfig();
-
-  if (!saveConfig()) {
-    server.send(500, "text/html", getSettingsPageHtml("Failed to save settings."));
-    return;
-  }
-
-  server.send(200, "text/html", getSavedPageHtml("Settings saved"));
-  delay(200);
-  delayedRebootMessage("SETTINGS SAVED", "REBOOT IN 3 SECONDS");
-}
-
-void handleReboot() {
-  logLine("Web request: reboot");
-  server.send(200, "text/html", getSavedPageHtml("Rebooting device"));
-  delay(200);
-  delayedRebootMessage("REBOOT DEVICE", "PLEASE WAIT");
-}
-
-void handleResetSettings() {
-  logLine("Web request: reset settings");
+void handleReset() {
   clearConfigFile();
-  setDefaultConfig();
-  saveConfig();
-  server.send(200, "text/html", getSavedPageHtml("Settings reset"));
-  delay(200);
-  delayedRebootMessage("SETTINGS RESET", "STARTING SETUP MODE");
+  server.send(200, "text/html",
+    "<html><body style='font-family:Arial;background:#111;color:#fff;padding:20px;'>"
+    "<h2>Settings cleared</h2><p>Device will reboot in 3 seconds.</p></body></html>"
+  );
+  delay(3000);
+  ESP.restart();
+}
+
+void handleOta() {
+  server.send(200, "text/html",
+    "<html><body style='font-family:Arial;background:#111;color:#fff;padding:20px;'>"
+    "<h2>Checking OTA update</h2><p>The device screen will show progress.</p><p><a href='/'>Back</a></p></body></html>"
+  );
+  delay(500);
+  checkForOtaUpdate();
+  renderCurrentPage();
 }
 
 void startWebServer() {
+  if (webServerStarted) return;
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.on("/reboot", HTTP_POST, handleReboot);
-  server.on("/reset-settings", HTTP_POST, handleResetSettings);
+  server.on("/refresh", HTTP_GET, handleRefresh);
+  server.on("/reset", HTTP_GET, handleReset);
+  server.on("/ota", HTTP_GET, handleOta);
+
   server.begin();
   webServerStarted = true;
   logLine("Web server started");
 }
 
-void updateIpAddressText() {
-  if (inApMode) {
-    ipAddressText = WiFi.softAPIP().toString();
-  } else if (WiFi.status() == WL_CONNECTED) {
-    ipAddressText = WiFi.localIP().toString();
-  } else {
-    ipAddressText = "0.0.0.0";
-  }
-}
-
-void startApMode() {
-  inApMode = true;
-  mdnsStarted = false;
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID);
-  updateIpAddressText();
-
-  renderSetupScreen("SETUP MODE", AP_SSID, ipAddressText);
-
-  if (!webServerStarted) {
-    startWebServer();
-  }
-
-  logLine("AP mode started");
-  logLine("AP SSID: " + String(AP_SSID));
-  logLine("AP IP: " + ipAddressText);
-}
-
-bool connectWiFi() {
-  if (config.wifiSsid.length() == 0) {
-    logLine("No WiFi config present");
-    return false;
-  }
-
-  inApMode = false;
-  WiFi.mode(WIFI_STA);
-  WiFi.hostname(HOSTNAME);
-  WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
-
-  for (int attempt = 1; attempt <= WIFI_RETRY_COUNT; attempt++) {
-    logLine("WiFi attempt " + String(attempt));
-
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_RETRY_WINDOW_MS) {
-      delay(500);
-      Serial.print(".");
-      if (webServerStarted) server.handleClient();
-    }
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
-      updateIpAddressText();
-      logLine("WiFi connected");
-      logLine("SSID: " + config.wifiSsid);
-      logLine("IP: " + ipAddressText);
-      return true;
-    }
-
-    WiFi.disconnect();
-    delay(500);
-    WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
-  }
-
-  logLine("WiFi failed after retries");
-  return false;
-}
-
 void startMdnsIfNeeded() {
-  if (!inApMode && WiFi.status() == WL_CONNECTED) {
-    mdnsStarted = MDNS.begin(HOSTNAME);
-    if (mdnsStarted) {
-      logLine("mDNS started: http://f1-display.local");
-    } else {
-      logLine("mDNS failed to start");
-    }
-  }
-}
-
-void initTimeSystem() {
-  logLine("Starting time sync");
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  applyRuntimeConfig();
-
-  time_t now = time(nullptr);
-  int retries = 0;
-  while (now < 100000 && retries < 20) {
-    delay(500);
-    now = time(nullptr);
-    retries++;
-  }
-
-  if (now >= 100000) {
-    logLine("Time sync complete");
+  if (mdnsStarted) return;
+  if (MDNS.begin(HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsStarted = true;
+    logLine("mDNS started");
   } else {
-    logLine("Time sync not confirmed");
+    logLine("mDNS failed");
   }
-}
-
-void refreshAllData() {
-  if (inApMode || WiFi.status() != WL_CONNECTED) return;
-
-  logLine("Refreshing F1 data...");
-  bool okDrivers = fetchDriverStandings();
-  bool okConstructors = fetchConstructorStandings();
-  bool okNextRace = fetchNextRace();
-
-  logLine("Drivers: " + String(okDrivers ? "OK" : "FAIL"));
-  logLine("Constructors: " + String(okConstructors ? "OK" : "FAIL"));
-  logLine("Next race: " + String(okNextRace ? "OK" : "FAIL"));
-
-  lastRefresh = millis();
-  lastRefreshText = formatClockShortLocal();
 }
 
 void setupDisplay() {
   tft.init();
   tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextWrap(false);
   initPalette();
-  renderSetupScreen("BOOTING...");
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(200);
 
-  logLine("");
-  logLine("Booting F1 Display");
-  logLine("Firmware: " + String(FW_VERSION));
+  setupDisplay();
+  renderSetupScreen("BOOTING");
 
   if (!LittleFS.begin()) {
-    logLine("LittleFS mount failed");
-  } else {
-    logLine("LittleFS mounted");
+    renderSetupScreen("LITTLEFS FAILED");
+    while (true) {
+      delay(1000);
+    }
   }
 
   setDefaultConfig();
   loadConfig();
-
-  setupDisplay();
   applyRuntimeConfig();
 
-  if (!connectWiFi()) {
+  if (connectToWifi()) {
+    inApMode = false;
+    syncTimeNow();
+    startMdnsIfNeeded();
     startWebServer();
+    checkForOtaUpdate();
+    refreshAllData();
+    renderCurrentPage();
+  } else {
     startApMode();
-    return;
+    startWebServer();
   }
-
-  updateIpAddressText();
-  startWebServer();
-  startMdnsIfNeeded();
-  initTimeSystem();
-  refreshAllData();
-  renderCurrentPage();
 
   lastPageSwitch = millis();
 }
 
 void loop() {
-  if (webServerStarted) {
-    server.handleClient();
-  }
+  server.handleClient();
+  MDNS.update();
 
-  if (!inApMode && mdnsStarted) {
-    MDNS.update();
-  }
-
-  if (inApMode) {
-    delay(10);
-    return;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    logLine("WiFi disconnected, attempting reconnect");
-    if (!connectWiFi()) {
-      startApMode();
-      return;
+  if (!inApMode) {
+    if (WiFi.status() != WL_CONNECTED) {
+      ipAddressText = "0.0.0.0";
+    } else {
+      ipAddressText = WiFi.localIP().toString();
     }
-    updateIpAddressText();
-    startMdnsIfNeeded();
-    renderCurrentPage();
+
+    unsigned long now = millis();
+
+    if (now - lastPageSwitch >= pageIntervalMs) {
+      lastPageSwitch = now;
+      nextPage();
+    }
+
+    if (WiFi.status() == WL_CONNECTED && (now - lastRefresh >= refreshIntervalMs)) {
+      syncTimeNow();
+      refreshAllData();
+      renderCurrentPage();
+    }
   }
 
-  unsigned long now = millis();
-
-  if (now - lastRefresh >= refreshIntervalMs) {
-    refreshAllData();
-    renderCurrentPage();
-  }
-
-  if (now - lastPageSwitch >= pageIntervalMs) {
-    lastPageSwitch = now;
-    nextPage();
-    renderCurrentPage();
-  }
+  delay(20);
 }
